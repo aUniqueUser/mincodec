@@ -1,0 +1,15 @@
+[package]
+name = "mincodec"
+version = "0.1.0"
+authors = ["Izzy Swart <zenerboson@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+void = { version = "1.0.2", default-features = false }
+bitbuf = { git = "https://github.com/noocene/bitbuf" }
+bitbuf-vlq = { git = "https://github.com/noocene/bitbuf-vlq", optional = true }
+
+[features]
+std = ["alloc", "void/std"]
+alloc = ["bitbuf-vlq"]
+default = ["std", "alloc"]
