@@ -14,9 +14,9 @@ pub trait MinCodec: Sized {
     type WriteError;
     type ReadError;
 
-    fn write<'a>(self, buf: &mut BitBufMut<'a>) -> Result<(), Self::WriteError>;
+    fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError>;
 
-    fn read<'a>(buf: &mut BitBuf<'a>) -> Result<Self, Self::ReadError>;
+    fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError>;
 }
 
 macro_rules! impl_primitives {
@@ -35,14 +35,14 @@ macro_rules! impl_primitives {
     (numbers $($ty:ty)*) => {
         $(
             impl MinCodec for $ty {
-                type ReadError = Insufficient;
-                type WriteError = Insufficient;
+                type ReadError = CopyError;
+                type WriteError = CopyError;
 
-                fn write<'a>(self, buf: &mut BitBufMut<'a>) -> Result<(), Self::WriteError> {
+                fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
                     buf.put_aligned(self.to_be_bytes().as_ref())
                 }
 
-                fn read<'a>(buf: &mut BitBuf<'a>) -> Result<Self, Self::ReadError> {
+                fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
                     let mut bytes = [0u8; size_of::<Self>()];
                     buf.copy_aligned(&mut bytes)?;
                     Ok(Self::from_be_bytes(bytes))
@@ -53,14 +53,14 @@ macro_rules! impl_primitives {
 }
 
 impl MinCodec for usize {
-    type ReadError = Insufficient;
-    type WriteError = Insufficient;
+    type ReadError = CopyError;
+    type WriteError = CopyError;
 
-    fn write<'a>(self, buf: &mut BitBufMut<'a>) -> Result<(), Self::WriteError> {
+    fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
         buf.put_aligned((self as u64).to_be_bytes().as_ref())
     }
 
-    fn read<'a>(buf: &mut BitBuf<'a>) -> Result<Self, Self::ReadError> {
+    fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
         let mut bytes = [0u8; size_of::<u64>()];
         buf.copy_aligned(&mut bytes)?;
         Ok(u64::from_be_bytes(bytes) as usize)
@@ -68,14 +68,14 @@ impl MinCodec for usize {
 }
 
 impl MinCodec for isize {
-    type ReadError = Insufficient;
-    type WriteError = Insufficient;
+    type ReadError = CopyError;
+    type WriteError = CopyError;
 
-    fn write<'a>(self, buf: &mut BitBufMut<'a>) -> Result<(), Self::WriteError> {
+    fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
         buf.put_aligned((self as i64).to_be_bytes().as_ref())
     }
 
-    fn read<'a>(buf: &mut BitBuf<'a>) -> Result<Self, Self::ReadError> {
+    fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
         let mut bytes = [0u8; size_of::<i64>()];
         buf.copy_aligned(&mut bytes)?;
         Ok(i64::from_be_bytes(bytes) as isize)
@@ -83,14 +83,14 @@ impl MinCodec for isize {
 }
 
 impl MinCodec for char {
-    type ReadError = Insufficient;
-    type WriteError = Insufficient;
+    type ReadError = CopyError;
+    type WriteError = CopyError;
 
-    fn write<'a>(self, buf: &mut BitBufMut<'a>) -> Result<(), Self::WriteError> {
+    fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
         buf.put_aligned((self as u8).to_be_bytes().as_ref())
     }
 
-    fn read<'a>(buf: &mut BitBuf<'a>) -> Result<Self, Self::ReadError> {
+    fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
         let mut bytes = [0u8; size_of::<u8>()];
         buf.copy_aligned(&mut bytes)?;
         Ok(u8::from_be_bytes(bytes) as char)
@@ -103,11 +103,11 @@ impl MinCodec for bool {
     type WriteError = Insufficient;
     type ReadError = Insufficient;
 
-    fn write<'a>(self, buf: &mut BitBufMut<'a>) -> Result<(), Self::WriteError> {
+    fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
         buf.push(self)
     }
 
-    fn read<'a>(buf: &mut BitBuf<'a>) -> Result<Self, Self::ReadError> {
+    fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
         buf.pop().ok_or(Insufficient)
     }
 }
@@ -116,11 +116,11 @@ impl MinCodec for () {
     type WriteError = Void;
     type ReadError = Void;
 
-    fn write<'a>(self, _: &mut BitBufMut<'a>) -> Result<(), Self::WriteError> {
+    fn write<B: BitBufMut>(self, _: &mut B) -> Result<(), Self::WriteError> {
         Ok(())
     }
 
-    fn read<'a>(_: &mut BitBuf<'a>) -> Result<Self, Self::ReadError> {
+    fn read<B: BitBuf>(_: &mut B) -> Result<Self, Self::ReadError> {
         Ok(())
     }
 }
@@ -129,11 +129,11 @@ impl<T> MinCodec for [T; 0] {
     type WriteError = Void;
     type ReadError = Void;
 
-    fn write<'a>(self, _: &mut BitBufMut<'a>) -> Result<(), Self::WriteError> {
+    fn write<B: BitBufMut>(self, _: &mut B) -> Result<(), Self::WriteError> {
         Ok(())
     }
 
-    fn read<'a>(_: &mut BitBuf<'a>) -> Result<Self, Self::ReadError> {
+    fn read<B: BitBuf>(_: &mut B) -> Result<Self, Self::ReadError> {
         Ok([])
     }
 }
@@ -142,11 +142,11 @@ impl<T: ?Sized> MinCodec for PhantomData<T> {
     type WriteError = Void;
     type ReadError = Void;
 
-    fn write<'a>(self, _: &mut BitBufMut<'a>) -> Result<(), Self::WriteError> {
+    fn write<B: BitBufMut>(self, _: &mut B) -> Result<(), Self::WriteError> {
         Ok(())
     }
 
-    fn read<'a>(_: &mut BitBuf<'a>) -> Result<Self, Self::ReadError> {
+    fn read<B: BitBuf>(_: &mut B) -> Result<Self, Self::ReadError> {
         Ok(PhantomData)
     }
 }
@@ -155,11 +155,11 @@ impl MinCodec for PhantomPinned {
     type WriteError = Void;
     type ReadError = Void;
 
-    fn write<'a>(self, _: &mut BitBufMut<'a>) -> Result<(), Self::WriteError> {
+    fn write<B: BitBufMut>(self, _: &mut B) -> Result<(), Self::WriteError> {
         Ok(())
     }
 
-    fn read<'a>(_: &mut BitBuf<'a>) -> Result<Self, Self::ReadError> {
+    fn read<B: BitBuf>(_: &mut B) -> Result<Self, Self::ReadError> {
         Ok(PhantomPinned)
     }
 }
@@ -174,7 +174,7 @@ macro_rules! array_impls {
                 type WriteError = T::WriteError;
                 type ReadError = T::ReadError;
 
-                fn write<'a>(self, buf: &mut BitBufMut<'a>) -> Result<(), Self::WriteError> {
+                fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
                     use core::ptr::read;
 
                     for i in 0..$len {
@@ -184,7 +184,7 @@ macro_rules! array_impls {
                     Ok(())
                 }
 
-                fn read<'a>(buf: &mut BitBuf<'a>) -> Result<Self, Self::ReadError> {
+                fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
                     use core::{mem::MaybeUninit, ptr::write};
 
                     let mut data: MaybeUninit<[T; $len]> = MaybeUninit::uninit();
@@ -215,12 +215,12 @@ impl<T: MinCodec> MinCodec for (T,) {
     type WriteError = T::WriteError;
     type ReadError = T::ReadError;
 
-    fn write<'a>(self, buf: &mut BitBufMut<'a>) -> Result<(), Self::WriteError> {
+    fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
         self.0.write(buf)?;
         Ok(())
     }
 
-    fn read<'a>(buf: &mut BitBuf<'a>) -> Result<Self, Self::ReadError> {
+    fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
         Ok((T::read(buf)?,))
     }
 }
@@ -253,14 +253,14 @@ macro_rules! tuple_impls {
                 type WriteError = $we<$($name),+>;
                 type ReadError = $re<$($name),+>;
 
-                fn write<'a>(self, buf: &mut BitBufMut<'a>) -> Result<(), Self::WriteError> {
+                fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
                     $(
                         self.$n.write(buf).map_err($we::$name)?;
                     )+
                     Ok(())
                 }
 
-                fn read<'a>(buf: &mut BitBuf<'a>) -> Result<Self, Self::ReadError> {
+                fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
                     Ok(($(
                         $name::read(buf).map_err($re::$name)?
                     ),+))
@@ -316,7 +316,7 @@ impl<T: MinCodec> MinCodec for Option<T> {
     type ReadError = OptionReadError<T::ReadError>;
     type WriteError = OptionWriteError<T::WriteError>;
 
-    fn write<'a>(self, buf: &mut BitBufMut<'a>) -> Result<(), Self::WriteError> {
+    fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
         Ok(match self {
             None => buf.push(false)?,
             Some(item) => {
@@ -326,7 +326,7 @@ impl<T: MinCodec> MinCodec for Option<T> {
         })
     }
 
-    fn read<'a>(buf: &mut BitBuf<'a>) -> Result<Self, Self::ReadError> {
+    fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
         Ok(
             if buf
                 .pop()
@@ -371,7 +371,7 @@ impl<T: MinCodec, E: MinCodec> MinCodec for Result<T, E> {
     type ReadError = ResultReadError<T::ReadError, E::ReadError>;
     type WriteError = ResultWriteError<T::WriteError, E::WriteError>;
 
-    fn write<'a>(self, buf: &mut BitBufMut<'a>) -> Result<(), Self::WriteError> {
+    fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
         Ok(match self {
             Ok(v) => {
                 buf.push(false)?;
@@ -384,7 +384,7 @@ impl<T: MinCodec, E: MinCodec> MinCodec for Result<T, E> {
         })
     }
 
-    fn read<'a>(buf: &mut BitBuf<'a>) -> Result<Self, Self::ReadError> {
+    fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
         Ok(if buf.pop().ok_or(CopyError::Insufficient(Insufficient))? {
             Ok(T::read(buf).map_err(ResultReadError::ReadOk)?)
         } else {
@@ -414,7 +414,7 @@ mod _alloc {
         Vlq(Error),
         TooLong,
         Utf8(FromUtf8Error),
-        Insufficient(Insufficient),
+        Buf(CopyError),
     }
 
     impl From<FromUtf8Error> for StringReadError {
@@ -429,24 +429,24 @@ mod _alloc {
         }
     }
 
-    impl From<Insufficient> for StringReadError {
-        fn from(input: Insufficient) -> Self {
-            StringReadError::Insufficient(input)
+    impl From<CopyError> for StringReadError {
+        fn from(input: CopyError) -> Self {
+            StringReadError::Buf(input)
         }
     }
 
     impl MinCodec for String {
-        type WriteError = Insufficient;
+        type WriteError = CopyError;
         type ReadError = StringReadError;
 
-        fn write<'a>(self, buf: &mut BitBufMut<'a>) -> Result<(), Self::WriteError> {
+        fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
             let bytes = self.as_bytes();
             buf.put_aligned(&*Vlq::from(bytes.len() as u64))?;
             buf.put_aligned(bytes)?;
             Ok(())
         }
 
-        fn read<'a>(buf: &mut BitBuf<'a>) -> Result<Self, Self::ReadError> {
+        fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
             let len = Vlq::read(buf)?;
             let len: usize = len.try_into().map_err(|_| StringReadError::TooLong)?;
             let mut data = vec![0u8; len];
@@ -458,7 +458,7 @@ mod _alloc {
     #[derive(Debug)]
     pub enum VecWriteError<T> {
         Content(T),
-        Insufficient(Insufficient),
+        Buf(CopyError),
     }
 
     #[derive(Debug)]
@@ -474,9 +474,9 @@ mod _alloc {
         }
     }
 
-    impl<T> From<Insufficient> for VecWriteError<T> {
-        fn from(input: Insufficient) -> Self {
-            VecWriteError::Insufficient(input)
+    impl<T> From<CopyError> for VecWriteError<T> {
+        fn from(input: CopyError) -> Self {
+            VecWriteError::Buf(input)
         }
     }
 
@@ -484,7 +484,7 @@ mod _alloc {
         type WriteError = VecWriteError<T::WriteError>;
         type ReadError = VecReadError<T::ReadError>;
 
-        fn write<'a>(self, buf: &mut BitBufMut<'a>) -> Result<(), Self::WriteError> {
+        fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
             buf.put_aligned(&*Vlq::from(self.len() as u64))?;
             for item in self {
                 item.write(buf).map_err(VecWriteError::Content)?;
@@ -492,7 +492,7 @@ mod _alloc {
             Ok(())
         }
 
-        fn read<'a>(buf: &mut BitBuf<'a>) -> Result<Self, Self::ReadError> {
+        fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
             let len = Vlq::read(buf)?;
             let len: usize = len.try_into().map_err(|_| VecReadError::TooLong)?;
             let mut data = Vec::with_capacity(len);
