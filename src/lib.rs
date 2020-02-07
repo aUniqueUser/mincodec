@@ -3,7 +3,7 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
-use bitbuf::{BitBuf, BitBufMut, CopyError, Insufficient};
+use bitbuf::{BitBuf, BitBufMut, Insufficient, UnalignedError};
 use core::{
     marker::{PhantomData, PhantomPinned},
     mem::size_of,
@@ -39,12 +39,12 @@ macro_rules! impl_primitives {
                 type WriteError = Insufficient;
 
                 fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
-                    buf.put_aligned(self.to_be_bytes().as_ref())
+                    buf.write_aligned(self.to_be_bytes().as_ref())
                 }
 
                 fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
                     let mut bytes = [0u8; size_of::<Self>()];
-                    buf.copy_aligned(&mut bytes)?;
+                    buf.read_aligned(&mut bytes)?;
                     Ok(Self::from_be_bytes(bytes))
                 }
             }
@@ -57,12 +57,12 @@ impl MinCodec for usize {
     type WriteError = Insufficient;
 
     fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
-        buf.put_aligned((self as u64).to_be_bytes().as_ref())
+        buf.write_aligned((self as u64).to_be_bytes().as_ref())
     }
 
     fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
         let mut bytes = [0u8; size_of::<u64>()];
-        buf.copy_aligned(&mut bytes)?;
+        buf.read_aligned(&mut bytes)?;
         Ok(u64::from_be_bytes(bytes) as usize)
     }
 }
@@ -72,12 +72,12 @@ impl MinCodec for isize {
     type WriteError = Insufficient;
 
     fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
-        buf.put_aligned((self as i64).to_be_bytes().as_ref())
+        buf.write_aligned((self as i64).to_be_bytes().as_ref())
     }
 
     fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
         let mut bytes = [0u8; size_of::<i64>()];
-        buf.copy_aligned(&mut bytes)?;
+        buf.read_aligned(&mut bytes)?;
         Ok(i64::from_be_bytes(bytes) as isize)
     }
 }
@@ -87,12 +87,12 @@ impl MinCodec for char {
     type WriteError = Insufficient;
 
     fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
-        buf.put_aligned((self as u8).to_be_bytes().as_ref())
+        buf.write_aligned((self as u8).to_be_bytes().as_ref())
     }
 
     fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
         let mut bytes = [0u8; size_of::<u8>()];
-        buf.copy_aligned(&mut bytes)?;
+        buf.read_aligned(&mut bytes)?;
         Ok(u8::from_be_bytes(bytes) as char)
     }
 }
@@ -104,11 +104,11 @@ impl MinCodec for bool {
     type ReadError = Insufficient;
 
     fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
-        buf.push(self)
+        buf.write_bool(self)
     }
 
     fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
-        buf.pop().ok_or(Insufficient)
+        buf.read_bool().ok_or(Insufficient)
     }
 }
 
@@ -302,7 +302,7 @@ impl<T> From<Insufficient> for OptionWriteError<T> {
 
 #[derive(Debug)]
 pub enum OptionReadError<T> {
-    Buf(CopyError),
+    Buf(UnalignedError),
     Read(T),
 }
 
@@ -318,9 +318,9 @@ impl<T: MinCodec> MinCodec for Option<T> {
 
     fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
         Ok(match self {
-            None => buf.push(false)?,
+            None => buf.write_bool(false)?,
             Some(item) => {
-                buf.push(true)?;
+                buf.write_bool(true)?;
                 item.write(buf).map_err(OptionWriteError::Write)?;
             }
         })
@@ -329,8 +329,8 @@ impl<T: MinCodec> MinCodec for Option<T> {
     fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
         Ok(
             if buf
-                .pop()
-                .ok_or(CopyError::Insufficient(Insufficient))
+                .read_bool()
+                .ok_or(UnalignedError::Insufficient(Insufficient))
                 .map_err(OptionReadError::Buf)?
             {
                 Some(T::read(buf)?)
@@ -356,13 +356,13 @@ impl<T, E> From<Insufficient> for ResultWriteError<T, E> {
 
 #[derive(Debug)]
 pub enum ResultReadError<T, E> {
-    Buf(CopyError),
+    Buf(UnalignedError),
     ReadOk(T),
     ReadErr(E),
 }
 
-impl<T, E> From<CopyError> for ResultReadError<T, E> {
-    fn from(error: CopyError) -> Self {
+impl<T, E> From<UnalignedError> for ResultReadError<T, E> {
+    fn from(error: UnalignedError) -> Self {
         ResultReadError::Buf(error)
     }
 }
@@ -374,22 +374,27 @@ impl<T: MinCodec, E: MinCodec> MinCodec for Result<T, E> {
     fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
         Ok(match self {
             Ok(v) => {
-                buf.push(false)?;
+                buf.write_bool(false)?;
                 v.write(buf).map_err(ResultWriteError::WriteOk)?
             }
             Err(v) => {
-                buf.push(true)?;
+                buf.write_bool(true)?;
                 v.write(buf).map_err(ResultWriteError::WriteErr)?;
             }
         })
     }
 
     fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
-        Ok(if buf.pop().ok_or(CopyError::Insufficient(Insufficient))? {
-            Ok(T::read(buf).map_err(ResultReadError::ReadOk)?)
-        } else {
-            Err(E::read(buf).map_err(ResultReadError::ReadErr)?)
-        })
+        Ok(
+            if buf
+                .read_bool()
+                .ok_or(UnalignedError::Insufficient(Insufficient))?
+            {
+                Ok(T::read(buf).map_err(ResultReadError::ReadOk)?)
+            } else {
+                Err(E::read(buf).map_err(ResultReadError::ReadErr)?)
+            },
+        )
     }
 }
 
@@ -436,13 +441,13 @@ mod _alloc {
     }
 
     impl MinCodec for String {
-        type WriteError = CopyError;
+        type WriteError = UnalignedError;
         type ReadError = StringReadError;
 
         fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
             let bytes = self.as_bytes();
-            buf.put_aligned(&*Vlq::from(bytes.len() as u64))?;
-            buf.put_aligned(bytes)?;
+            buf.write_aligned(&*Vlq::from(bytes.len() as u64))?;
+            buf.write_aligned(bytes)?;
             Ok(())
         }
 
@@ -450,7 +455,7 @@ mod _alloc {
             let len = Vlq::read(buf)?;
             let len: usize = len.try_into().map_err(|_| StringReadError::TooLong)?;
             let mut data = vec![0u8; len];
-            buf.copy_aligned(&mut data)?;
+            buf.read_aligned(&mut data)?;
             Ok(String::from_utf8(data)?)
         }
     }
@@ -485,7 +490,7 @@ mod _alloc {
         type ReadError = VecReadError<T::ReadError>;
 
         fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
-            buf.put_aligned(&*Vlq::from(self.len() as u64))?;
+            buf.write_aligned(&*Vlq::from(self.len() as u64))?;
             for item in self {
                 item.write(buf).map_err(VecWriteError::Content)?;
             }
