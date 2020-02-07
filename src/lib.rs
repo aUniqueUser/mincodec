@@ -35,8 +35,8 @@ macro_rules! impl_primitives {
     (numbers $($ty:ty)*) => {
         $(
             impl MinCodec for $ty {
-                type ReadError = CopyError;
-                type WriteError = CopyError;
+                type ReadError = Insufficient;
+                type WriteError = Insufficient;
 
                 fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
                     buf.put_aligned(self.to_be_bytes().as_ref())
@@ -53,8 +53,8 @@ macro_rules! impl_primitives {
 }
 
 impl MinCodec for usize {
-    type ReadError = CopyError;
-    type WriteError = CopyError;
+    type ReadError = Insufficient;
+    type WriteError = Insufficient;
 
     fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
         buf.put_aligned((self as u64).to_be_bytes().as_ref())
@@ -68,8 +68,8 @@ impl MinCodec for usize {
 }
 
 impl MinCodec for isize {
-    type ReadError = CopyError;
-    type WriteError = CopyError;
+    type ReadError = Insufficient;
+    type WriteError = Insufficient;
 
     fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
         buf.put_aligned((self as i64).to_be_bytes().as_ref())
@@ -83,8 +83,8 @@ impl MinCodec for isize {
 }
 
 impl MinCodec for char {
-    type ReadError = CopyError;
-    type WriteError = CopyError;
+    type ReadError = Insufficient;
+    type WriteError = Insufficient;
 
     fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
         buf.put_aligned((self as u8).to_be_bytes().as_ref())
@@ -414,7 +414,7 @@ mod _alloc {
         Vlq(Error),
         TooLong,
         Utf8(FromUtf8Error),
-        Buf(CopyError),
+        Buf(Insufficient),
     }
 
     impl From<FromUtf8Error> for StringReadError {
@@ -429,8 +429,8 @@ mod _alloc {
         }
     }
 
-    impl From<CopyError> for StringReadError {
-        fn from(input: CopyError) -> Self {
+    impl From<Insufficient> for StringReadError {
+        fn from(input: Insufficient) -> Self {
             StringReadError::Buf(input)
         }
     }
@@ -458,7 +458,7 @@ mod _alloc {
     #[derive(Debug)]
     pub enum VecWriteError<T> {
         Content(T),
-        Buf(CopyError),
+        Buf(Insufficient),
     }
 
     #[derive(Debug)]
@@ -474,8 +474,8 @@ mod _alloc {
         }
     }
 
-    impl<T> From<CopyError> for VecWriteError<T> {
-        fn from(input: CopyError) -> Self {
+    impl<T> From<Insufficient> for VecWriteError<T> {
+        fn from(input: Insufficient) -> Self {
             VecWriteError::Buf(input)
         }
     }
