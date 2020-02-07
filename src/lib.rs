@@ -19,18 +19,6 @@ pub trait MinCodec: Sized {
     fn read<'a>(buf: &mut BitBuf<'a>) -> Result<Self, Self::ReadError>;
 }
 
-#[derive(Debug)]
-pub enum PrimitiveError {
-    Insufficient { expected: usize, remaining: usize },
-    Buf(Insufficient),
-}
-
-impl From<Insufficient> for PrimitiveError {
-    fn from(error: Insufficient) -> Self {
-        PrimitiveError::Buf(error)
-    }
-}
-
 macro_rules! impl_primitives {
     () => {
         impl_primitives! {
@@ -47,7 +35,7 @@ macro_rules! impl_primitives {
     (numbers $($ty:ty)*) => {
         $(
             impl MinCodec for $ty {
-                type ReadError = PrimitiveError;
+                type ReadError = Insufficient;
                 type WriteError = Insufficient;
 
                 fn write<'a>(self, buf: &mut BitBufMut<'a>) -> Result<(), Self::WriteError> {
@@ -65,7 +53,7 @@ macro_rules! impl_primitives {
 }
 
 impl MinCodec for usize {
-    type ReadError = PrimitiveError;
+    type ReadError = Insufficient;
     type WriteError = Insufficient;
 
     fn write<'a>(self, buf: &mut BitBufMut<'a>) -> Result<(), Self::WriteError> {
@@ -80,7 +68,7 @@ impl MinCodec for usize {
 }
 
 impl MinCodec for isize {
-    type ReadError = PrimitiveError;
+    type ReadError = Insufficient;
     type WriteError = Insufficient;
 
     fn write<'a>(self, buf: &mut BitBufMut<'a>) -> Result<(), Self::WriteError> {
@@ -95,7 +83,7 @@ impl MinCodec for isize {
 }
 
 impl MinCodec for char {
-    type ReadError = PrimitiveError;
+    type ReadError = Insufficient;
     type WriteError = Insufficient;
 
     fn write<'a>(self, buf: &mut BitBufMut<'a>) -> Result<(), Self::WriteError> {
