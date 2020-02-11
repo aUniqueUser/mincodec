@@ -8,8 +8,10 @@ edition = "2018"
 void = { version = "1.0.2", default-features = false }
 bitbuf = { git = "https://github.com/noocene/bitbuf" }
 bitbuf-vlq = { git = "https://github.com/noocene/bitbuf-vlq", optional = true }
+core-futures-io = { git = "https://github.com/noocene/core-futures-io", default-features = false }
+arrayvec = { version = "0.5.1", default-features = false }
 
 [features]
-std = ["alloc", "void/std"]
-alloc = ["bitbuf-vlq"]
+std = ["alloc", "void/std", "core-futures-io/std"]
+alloc = ["bitbuf-vlq", "core-futures-io/alloc"]
 default = ["std", "alloc"]

@@ -3,508 +3,514 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
-use bitbuf::{BitBuf, BitBufMut, Insufficient, UnalignedError};
+#[cfg(feature = "alloc")]
+pub mod allocated;
+
+pub mod array;
+pub mod option;
+pub mod primitive;
+pub mod result;
+pub mod tuple;
+
+#[doc(hidden)]
+pub use bitbuf::Insufficient;
+use bitbuf::{BitBuf, BitBufMut, BitSlice, BitSliceMut, Drain, Fill};
 use core::{
+    future::Future,
     marker::{PhantomData, PhantomPinned},
-    mem::size_of,
+    mem::{replace, size_of},
+    pin::Pin,
+    task::{Context, Poll},
 };
+use core_futures_io::{AsyncRead, AsyncWrite};
 use void::Void;
 
-pub trait MinCodec: Sized {
-    type WriteError;
-    type ReadError;
-
-    fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError>;
-
-    fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError>;
-}
-
-macro_rules! impl_primitives {
-    () => {
-        impl_primitives! {
-            as numbers {
-                u8 u16 u32 u64 u128
-                i8 i16 i32 i64 i128
-                f32 f64
+#[macro_export]
+macro_rules! sufficient {
+    ($e:expr $(,)?) => {
+        match $e {
+            ::core::result::Result::Ok(t) => t,
+            ::core::result::Result::Err(e) => {
+                let _: $crate::Insufficient = e;
+                return $crate::BufPoll::Insufficient;
             }
         }
     };
-    ($(as $cat:ident { $($ty:ty)* })*) => {
-        $(impl_primitives!($cat $($ty)*);)*
-    };
-    (numbers $($ty:ty)*) => {
-        $(
-            impl MinCodec for $ty {
-                type ReadError = Insufficient;
-                type WriteError = Insufficient;
+}
 
-                fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
-                    buf.write_aligned(self.to_be_bytes().as_ref())
-                }
-
-                fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
-                    let mut bytes = [0u8; size_of::<Self>()];
-                    buf.read_aligned(&mut bytes)?;
-                    Ok(Self::from_be_bytes(bytes))
-                }
+#[macro_export]
+macro_rules! buf_try {
+    ($e:expr $(,)?) => {
+        match $e {
+            ::core::result::Result::Ok(t) => t,
+            ::core::result::Result::Err(e) => {
+                return $crate::BufPoll::Ready(Err(e.into()));
             }
-        )*
+        }
     };
 }
 
-impl MinCodec for usize {
-    type ReadError = Insufficient;
-    type WriteError = Insufficient;
-
-    fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
-        buf.write_aligned((self as u64).to_be_bytes().as_ref())
-    }
-
-    fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
-        let mut bytes = [0u8; size_of::<u64>()];
-        buf.read_aligned(&mut bytes)?;
-        Ok(u64::from_be_bytes(bytes) as usize)
-    }
+#[macro_export]
+macro_rules! buf_ok {
+    ($e:expr $(,)?) => {
+        $crate::BufPoll::Ready(Ok($e))
+    };
 }
 
-impl MinCodec for isize {
-    type ReadError = Insufficient;
-    type WriteError = Insufficient;
-
-    fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
-        buf.write_aligned((self as i64).to_be_bytes().as_ref())
-    }
-
-    fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
-        let mut bytes = [0u8; size_of::<i64>()];
-        buf.read_aligned(&mut bytes)?;
-        Ok(i64::from_be_bytes(bytes) as isize)
-    }
+#[macro_export]
+macro_rules! buf_ready {
+    ($e:expr $(,)?) => {
+        match $e {
+            $crate::BufPoll::Pending => return $crate::BufPoll::Pending,
+            $crate::BufPoll::Insufficient => return $crate::BufPoll::Insufficient,
+            $crate::BufPoll::Ready(item) => item,
+        }
+    };
 }
 
-impl MinCodec for char {
-    type ReadError = Insufficient;
-    type WriteError = Insufficient;
-
-    fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
-        buf.write_aligned((self as u8).to_be_bytes().as_ref())
-    }
-
-    fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
-        let mut bytes = [0u8; size_of::<u8>()];
-        buf.read_aligned(&mut bytes)?;
-        Ok(u8::from_be_bytes(bytes) as char)
-    }
+pub enum BufPoll<T> {
+    Pending,
+    Insufficient,
+    Ready(T),
 }
 
-impl_primitives!();
+pub trait Serialize {
+    type Error;
 
-impl MinCodec for bool {
-    type WriteError = Insufficient;
-    type ReadError = Insufficient;
-
-    fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
-        buf.write_bool(self)
-    }
-
-    fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
-        buf.read_bool().ok_or(Insufficient)
-    }
+    fn poll_serialize<B: BitBufMut>(
+        self: Pin<&mut Self>,
+        ctx: &mut Context,
+        buf: &mut B,
+    ) -> BufPoll<Result<(), Self::Error>>;
 }
 
-impl MinCodec for () {
-    type WriteError = Void;
-    type ReadError = Void;
+pub trait Deserialize: Sized {
+    type Target;
+    type Error;
 
-    fn write<B: BitBufMut>(self, _: &mut B) -> Result<(), Self::WriteError> {
-        Ok(())
-    }
-
-    fn read<B: BitBuf>(_: &mut B) -> Result<Self, Self::ReadError> {
-        Ok(())
-    }
+    fn poll_deserialize<B: BitBuf>(
+        self: Pin<&mut Self>,
+        ctx: &mut Context,
+        buf: &mut B,
+    ) -> BufPoll<Result<Self::Target, Self::Error>>;
 }
 
-impl<T> MinCodec for [T; 0] {
-    type WriteError = Void;
-    type ReadError = Void;
+pub trait MinCodecWrite: Sized {
+    type Serialize: Serialize;
 
-    fn write<B: BitBufMut>(self, _: &mut B) -> Result<(), Self::WriteError> {
-        Ok(())
-    }
-
-    fn read<B: BitBuf>(_: &mut B) -> Result<Self, Self::ReadError> {
-        Ok([])
-    }
+    fn serialize(self) -> Self::Serialize;
 }
 
-impl<T: ?Sized> MinCodec for PhantomData<T> {
-    type WriteError = Void;
-    type ReadError = Void;
+pub trait MinCodecRead: Sized {
+    type Deserialize: Deserialize<Target = Self>;
 
-    fn write<B: BitBufMut>(self, _: &mut B) -> Result<(), Self::WriteError> {
-        Ok(())
-    }
-
-    fn read<B: BitBuf>(_: &mut B) -> Result<Self, Self::ReadError> {
-        Ok(PhantomData)
-    }
-}
-
-impl MinCodec for PhantomPinned {
-    type WriteError = Void;
-    type ReadError = Void;
-
-    fn write<B: BitBufMut>(self, _: &mut B) -> Result<(), Self::WriteError> {
-        Ok(())
-    }
-
-    fn read<B: BitBuf>(_: &mut B) -> Result<Self, Self::ReadError> {
-        Ok(PhantomPinned)
-    }
-}
-
-macro_rules! array_impls {
-    ($($len:tt)+) => {
-        $(
-            impl<T> MinCodec for [T; $len]
-            where
-                T: MinCodec,
-            {
-                type WriteError = T::WriteError;
-                type ReadError = T::ReadError;
-
-                fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
-                    use core::ptr::read;
-
-                    for i in 0..$len {
-                        unsafe { read(&self[i] as *const T) }.write(buf)?;
-                    }
-
-                    Ok(())
-                }
-
-                fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
-                    use core::{mem::MaybeUninit, ptr::write};
-
-                    let mut data: MaybeUninit<[T; $len]> = MaybeUninit::uninit();
-                    let ptr = data.as_mut_ptr() as *mut T;
-
-                    for _ in 0..$len {
-                        unsafe {
-                            write(ptr, T::read(buf)?);
-                            ptr.add(1);
-                        }
-                    }
-
-                    Ok(unsafe { data.assume_init() })
-                }
-            }
-        )+
-    }
-}
-
-array_impls! {
-    01 02 03 04 05 06 07 08 09 10
-    11 12 13 14 15 16 17 18 19 20
-    21 22 23 24 25 26 27 28 29 30
-    31 32
-}
-
-impl<T: MinCodec> MinCodec for (T,) {
-    type WriteError = T::WriteError;
-    type ReadError = T::ReadError;
-
-    fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
-        self.0.write(buf)?;
-        Ok(())
-    }
-
-    fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
-        Ok((T::read(buf)?,))
-    }
-}
-
-macro_rules! tuple_impls {
-    ($($we:ident $re:ident $len:expr => ($($n:tt $name:ident)+))+) => {
-        $(
-            #[derive(Debug)]
-            #[doc(hidden)]
-            pub enum $we<$($name),+>
-            where
-                $($name: MinCodec,)+
-            {
-                $($name($name::WriteError),)*
-            }
-
-            #[derive(Debug)]
-            #[doc(hidden)]
-            pub enum $re<$($name),+>
-            where
-                $($name: MinCodec,)+
-            {
-                $($name($name::ReadError),)*
-            }
-
-            impl<$($name),+> MinCodec for ($($name,)+)
-            where
-                $($name: MinCodec,)+
-            {
-                type WriteError = $we<$($name),+>;
-                type ReadError = $re<$($name),+>;
-
-                fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
-                    $(
-                        self.$n.write(buf).map_err($we::$name)?;
-                    )+
-                    Ok(())
-                }
-
-                fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
-                    Ok(($(
-                        $name::read(buf).map_err($re::$name)?
-                    ),+))
-                }
-            }
-        )+
-    }
-}
-
-tuple_impls! {
-    Enum1WriteError  Enum1ReadError  2 => (0 T0 1 T1)
-    Enum2WriteError  Enum2ReadError  3 => (0 T0 1 T1 2 T2)
-    Enum3WriteError  Enum3ReadError  4 => (0 T0 1 T1 2 T2 3 T3)
-    Enum4WriteError  Enum4ReadError  5 => (0 T0 1 T1 2 T2 3 T3 4 T4)
-    Enum5WriteError  Enum5ReadError  6 => (0 T0 1 T1 2 T2 3 T3 4 T4 5 T5)
-    Enum6WriteError  Enum6ReadError  7 => (0 T0 1 T1 2 T2 3 T3 4 T4 5 T5 6 T6)
-    Enum7WriteError  Enum7ReadError  8 => (0 T0 1 T1 2 T2 3 T3 4 T4 5 T5 6 T6 7 T7)
-    Enum8WriteError  Enum8ReadError  9 => (0 T0 1 T1 2 T2 3 T3 4 T4 5 T5 6 T6 7 T7 8 T8)
-    Enum9WriteError  Enum9ReadError  10 => (0 T0 1 T1 2 T2 3 T3 4 T4 5 T5 6 T6 7 T7 8 T8 9 T9)
-    Enum10WriteError Enum10ReadError 11 => (0 T0 1 T1 2 T2 3 T3 4 T4 5 T5 6 T6 7 T7 8 T8 9 T9 10 T10)
-    Enum11WriteError Enum11ReadError 12 => (0 T0 1 T1 2 T2 3 T3 4 T4 5 T5 6 T6 7 T7 8 T8 9 T9 10 T10 11 T11)
-    Enum12WriteError Enum12ReadError 13 => (0 T0 1 T1 2 T2 3 T3 4 T4 5 T5 6 T6 7 T7 8 T8 9 T9 10 T10 11 T11 12 T12)
-    Enum13WriteError Enum13ReadError 14 => (0 T0 1 T1 2 T2 3 T3 4 T4 5 T5 6 T6 7 T7 8 T8 9 T9 10 T10 11 T11 12 T12 13 T13)
-    Enum14WriteError Enum14ReadError 15 => (0 T0 1 T1 2 T2 3 T3 4 T4 5 T5 6 T6 7 T7 8 T8 9 T9 10 T10 11 T11 12 T12 13 T13 14 T14)
-    Enum15WriteError Enum15ReadError 16 => (0 T0 1 T1 2 T2 3 T3 4 T4 5 T5 6 T6 7 T7 8 T8 9 T9 10 T10 11 T11 12 T12 13 T13 14 T14 15 T15)
+    fn deserialize() -> Self::Deserialize;
 }
 
 #[derive(Debug)]
-pub enum OptionWriteError<T> {
-    Buf(Insufficient),
-    Write(T),
+pub enum ReadImmediateError<T> {
+    Insufficient,
+    Deserialize(T),
 }
 
-impl<T> From<Insufficient> for OptionWriteError<T> {
-    fn from(error: Insufficient) -> Self {
-        OptionWriteError::Buf(error)
+pub struct ReadImmediate<'a, T: MinCodecRead, B: BitBuf>(T::Deserialize, &'a mut B, bool);
+
+impl<'a, T: MinCodecRead, B: BitBuf> Future for ReadImmediate<'a, T, B>
+where
+    T::Deserialize: Unpin,
+{
+    type Output = Result<T, ReadImmediateError<<T::Deserialize as Deserialize>::Error>>;
+
+    fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        if this.2 {
+            panic!("ReadImmediate polled after completion")
+        }
+        match Pin::new(&mut this.0).poll_deserialize(ctx, this.1) {
+            BufPoll::Pending => Poll::Pending,
+            BufPoll::Insufficient => {
+                this.2 = true;
+                Poll::Ready(Err(ReadImmediateError::Insufficient))
+            }
+            BufPoll::Ready(item) => {
+                this.2 = true;
+                Poll::Ready(item.map_err(ReadImmediateError::Deserialize))
+            }
+        }
     }
 }
 
 #[derive(Debug)]
-pub enum OptionReadError<T> {
-    Buf(UnalignedError),
+pub enum WriteImmediateError<T> {
+    Insufficient,
+    Serialize(T),
+}
+
+pub struct WriteImmediate<'a, T: MinCodecWrite, B: BitBufMut>(T::Serialize, &'a mut B, bool);
+
+impl<'a, T: MinCodecWrite, B: BitBufMut> Future for WriteImmediate<'a, T, B>
+where
+    T::Serialize: Unpin,
+{
+    type Output = Result<usize, WriteImmediateError<<T::Serialize as Serialize>::Error>>;
+
+    fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        if this.2 {
+            panic!("WriteImmediate polled after completion")
+        }
+        match Pin::new(&mut this.0).poll_serialize(ctx, this.1) {
+            BufPoll::Pending => Poll::Pending,
+            BufPoll::Insufficient => {
+                this.2 = true;
+                Poll::Ready(Err(WriteImmediateError::Insufficient))
+            }
+            BufPoll::Ready(item) => {
+                this.2 = true;
+                Poll::Ready(
+                    item.map_err(WriteImmediateError::Serialize)
+                        .map(|_| this.1.len()),
+                )
+            }
+        }
+    }
+}
+
+pub trait MinCodecReadExt: MinCodecRead {
+    fn read_immediate<'a, B: BitBuf>(buf: &'a mut B) -> ReadImmediate<'a, Self, B>;
+    fn read_async_bytes<R: AsyncRead>(buf: R) -> AsyncReader<R, Self>;
+}
+
+impl<T: MinCodecRead> MinCodecReadExt for T {
+    fn read_immediate<'a, B: BitBuf>(buf: &'a mut B) -> ReadImmediate<'a, Self, B> {
+        ReadImmediate(T::deserialize(), buf, false)
+    }
+    fn read_async_bytes<R: AsyncRead>(buf: R) -> AsyncReader<R, Self> {
+        AsyncReader::new(buf)
+    }
+}
+
+pub trait MinCodecWriteExt: MinCodecWrite {
+    fn write_immediate<'a, B: BitBufMut>(self, buf: &'a mut B) -> WriteImmediate<'a, Self, B>;
+    fn write_async_bytes<W: AsyncWrite>(self, buf: W) -> AsyncWriter<W, Self>;
+}
+
+impl<T: MinCodecWrite> MinCodecWriteExt for T {
+    fn write_immediate<'a, B: BitBufMut>(self, buf: &'a mut B) -> WriteImmediate<'a, Self, B> {
+        WriteImmediate(self.serialize(), buf, false)
+    }
+    fn write_async_bytes<W: AsyncWrite>(self, buf: W) -> AsyncWriter<W, Self> {
+        AsyncWriter::new(buf, self)
+    }
+}
+
+pub trait MinCodec: MinCodecRead + MinCodecWrite {}
+
+impl<T: MinCodecWrite + MinCodecRead> MinCodec for T {}
+
+enum AsyncReaderState {
+    Reading,
+    Deserialize,
+    Complete,
+}
+
+const ASYNC_READER_BUF_SIZE: usize = 1024;
+
+pub struct AsyncReader<T: AsyncRead, U: MinCodecRead> {
+    reader: T,
+    buffer: [u8; ASYNC_READER_BUF_SIZE],
+    cursor: usize,
+    last_byte: usize,
+    deserializer: U::Deserialize,
+    state: AsyncReaderState,
+}
+
+enum AsyncWriterState {
+    Serialize,
+    Writing,
+    Complete,
+}
+
+const ASYNC_WRITER_BUF_SIZE: usize = 1024;
+
+pub struct AsyncWriter<T: AsyncWrite, U: MinCodecWrite> {
+    writer: T,
+    buffer: [u8; ASYNC_WRITER_BUF_SIZE],
+    serializer: U::Serialize,
+    cursor: usize,
+    done: bool,
+    state: AsyncWriterState,
+}
+
+impl<T: AsyncRead, U: MinCodecRead> AsyncReader<T, U> {
+    pub fn new(reader: T) -> Self {
+        AsyncReader {
+            reader,
+            last_byte: 0,
+            buffer: [0u8; ASYNC_READER_BUF_SIZE],
+            cursor: 0,
+            deserializer: U::deserialize(),
+            state: AsyncReaderState::Deserialize,
+        }
+    }
+}
+
+impl<T: AsyncWrite, U: MinCodecWrite> AsyncWriter<T, U> {
+    pub fn new(writer: T, data: U) -> Self {
+        AsyncWriter {
+            writer,
+            buffer: [0u8; ASYNC_WRITER_BUF_SIZE],
+            cursor: 0,
+            done: false,
+            serializer: data.serialize(),
+            state: AsyncWriterState::Serialize,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum AsyncReaderError<T, U> {
     Read(T),
+    Deserialize(U),
 }
 
-impl<T> From<T> for OptionReadError<T> {
-    fn from(error: T) -> Self {
-        OptionReadError::Read(error)
-    }
-}
+impl<T: AsyncRead + Unpin, U: MinCodecRead> Future for AsyncReader<T, U>
+where
+    U::Deserialize: Unpin,
+{
+    type Output = Result<U, AsyncReaderError<T::Error, <U::Deserialize as Deserialize>::Error>>;
 
-impl<T: MinCodec> MinCodec for Option<T> {
-    type ReadError = OptionReadError<T::ReadError>;
-    type WriteError = OptionWriteError<T::WriteError>;
-
-    fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
-        Ok(match self {
-            None => buf.write_bool(false)?,
-            Some(item) => {
-                buf.write_bool(true)?;
-                item.write(buf).map_err(OptionWriteError::Write)?;
+    fn poll(mut self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Self::Output> {
+        loop {
+            match self.state {
+                AsyncReaderState::Deserialize => {
+                    let this = &mut *self;
+                    let mut buf = BitSlice::new(&this.buffer[..this.last_byte]);
+                    buf.advance(this.cursor).unwrap();
+                    let poll = Pin::new(&mut this.deserializer).poll_deserialize(ctx, &mut buf);
+                    return match poll {
+                        BufPoll::Pending => Poll::Pending,
+                        BufPoll::Ready(item) => {
+                            this.state = AsyncReaderState::Complete;
+                            Poll::Ready(item.map_err(AsyncReaderError::Deserialize))
+                        }
+                        BufPoll::Insufficient => {
+                            this.cursor += buf.len();
+                            this.state = AsyncReaderState::Reading;
+                            continue;
+                        }
+                    };
+                }
+                AsyncReaderState::Reading => {
+                    let this = &mut *self;
+                    let cursor_bytes = this.cursor / 8;
+                    let mut read_buffer = [0u8; ASYNC_READER_BUF_SIZE];
+                    return match Pin::new(&mut this.reader).poll_read(
+                        ctx,
+                        &mut read_buffer[..ASYNC_READER_BUF_SIZE - (this.last_byte - cursor_bytes)],
+                    ) {
+                        Poll::Pending => Poll::Pending,
+                        Poll::Ready(data) => Poll::Ready(match data {
+                            Err(e) => Err(AsyncReaderError::Read(e)),
+                            Ok(size) => {
+                                this.buffer.copy_within(cursor_bytes..this.last_byte, 0);
+                                this.cursor &= 7;
+                                let mut deserialize_buf = BitSliceMut::new(&mut this.buffer);
+                                let first_byte = this.last_byte - cursor_bytes;
+                                deserialize_buf
+                                    .advance(first_byte * 8 + this.cursor)
+                                    .expect("could not advance by cursor remainder");
+                                deserialize_buf
+                                    .write_aligned_all(&read_buffer[..size])
+                                    .unwrap();
+                                this.last_byte = first_byte + size;
+                                this.state = AsyncReaderState::Deserialize;
+                                continue;
+                            }
+                        }),
+                    };
+                }
+                AsyncReaderState::Complete => panic!("AsyncReader polled after completion"),
             }
-        })
-    }
-
-    fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
-        Ok(
-            if buf
-                .read_bool()
-                .ok_or(UnalignedError::Insufficient(Insufficient))
-                .map_err(OptionReadError::Buf)?
-            {
-                Some(T::read(buf)?)
-            } else {
-                None
-            },
-        )
+        }
     }
 }
 
 #[derive(Debug)]
-pub enum ResultWriteError<T, E> {
-    Buf(Insufficient),
-    WriteOk(T),
-    WriteErr(E),
+pub enum AsyncWriterError<T, U> {
+    Write(T),
+    Serialize(U),
 }
 
-impl<T, E> From<Insufficient> for ResultWriteError<T, E> {
-    fn from(error: Insufficient) -> Self {
-        ResultWriteError::Buf(error)
+impl<T: AsyncWrite + Unpin, U: MinCodecWrite> Future for AsyncWriter<T, U>
+where
+    U::Serialize: Unpin,
+{
+    type Output = Result<(), AsyncWriterError<T::WriteError, <U::Serialize as Serialize>::Error>>;
+
+    fn poll(mut self: Pin<&mut Self>, ctx: &mut Context) -> Poll<Self::Output> {
+        loop {
+            match self.state {
+                AsyncWriterState::Writing => {
+                    let this = &mut *self;
+                    let mut l = 0u8;
+                    let re = this.cursor & 7;
+                    this.cursor /= 8;
+                    if this.done {
+                        l = this.buffer[this.cursor + 1];
+                    } else {
+                        this.cursor += 1;
+                    }
+                    match Pin::new(&mut this.writer).poll_write(ctx, &this.buffer[..this.cursor]) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(data) => match data {
+                            Ok(size) => {
+                                this.cursor -= size;
+                                if this.cursor == 0 {
+                                    if this.done {
+                                        this.state = AsyncWriterState::Complete;
+                                        return Poll::Ready(Ok(()));
+                                    } else {
+                                        this.cursor = re;
+                                        this.buffer[0] = l;
+                                        this.state = AsyncWriterState::Serialize;
+                                    }
+                                    continue;
+                                }
+                            }
+                            Err(e) => return Poll::Ready(Err(AsyncWriterError::Write(e))),
+                        },
+                    }
+                }
+                AsyncWriterState::Serialize => {
+                    let this = &mut *self;
+                    let mut buf = BitSliceMut::new(&mut this.buffer);
+                    buf.advance(this.cursor).unwrap();
+                    let poll = Pin::new(&mut this.serializer).poll_serialize(ctx, &mut buf);
+                    return match poll {
+                        BufPoll::Pending => Poll::Pending,
+                        BufPoll::Ready(item) => {
+                            this.cursor += buf.len();
+                            this.state = AsyncWriterState::Writing;
+                            this.done = true;
+                            item.map_err(AsyncWriterError::Serialize)?;
+                            continue;
+                        }
+                        BufPoll::Insufficient => {
+                            this.cursor += buf.len();
+                            this.state = AsyncWriterState::Writing;
+                            continue;
+                        }
+                    };
+                }
+                AsyncWriterState::Complete => panic!("AsyncWriter polled after completion"),
+            }
+        }
+    }
+}
+
+pub struct MapDeserialize<E, T: Deserialize, U, F: FnMut(T::Target) -> Result<U, E>> {
+    map: F,
+    deser: T,
+}
+
+impl<E, T: Unpin + Deserialize, U, F: Unpin + FnMut(T::Target) -> Result<U, E>>
+    MapDeserialize<E, T, U, F>
+{
+    fn new<R: MinCodecRead<Deserialize = T>>(map: F) -> Self
+    where
+        T: Deserialize<Target = R>,
+    {
+        MapDeserialize {
+            deser: R::deserialize(),
+            map,
+        }
     }
 }
 
 #[derive(Debug)]
-pub enum ResultReadError<T, E> {
-    Buf(UnalignedError),
-    ReadOk(T),
-    ReadErr(E),
+pub enum MapDeserializeError<T, U> {
+    Map(T),
+    Deserialize(U),
 }
 
-impl<T, E> From<UnalignedError> for ResultReadError<T, E> {
-    fn from(error: UnalignedError) -> Self {
-        ResultReadError::Buf(error)
-    }
-}
+impl<E, T: Unpin + Deserialize, U, F: Unpin + FnMut(T::Target) -> Result<U, E>> Deserialize
+    for MapDeserialize<E, T, U, F>
+{
+    type Target = U;
+    type Error = MapDeserializeError<E, T::Error>;
 
-impl<T: MinCodec, E: MinCodec> MinCodec for Result<T, E> {
-    type ReadError = ResultReadError<T::ReadError, E::ReadError>;
-    type WriteError = ResultWriteError<T::WriteError, E::WriteError>;
-
-    fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
-        Ok(match self {
-            Ok(v) => {
-                buf.write_bool(false)?;
-                v.write(buf).map_err(ResultWriteError::WriteOk)?
-            }
-            Err(v) => {
-                buf.write_bool(true)?;
-                v.write(buf).map_err(ResultWriteError::WriteErr)?;
-            }
-        })
-    }
-
-    fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
-        Ok(
-            if buf
-                .read_bool()
-                .ok_or(UnalignedError::Insufficient(Insufficient))?
-            {
-                Ok(T::read(buf).map_err(ResultReadError::ReadOk)?)
-            } else {
-                Err(E::read(buf).map_err(ResultReadError::ReadErr)?)
-            },
+    fn poll_deserialize<B: BitBuf>(
+        mut self: Pin<&mut Self>,
+        ctx: &mut Context,
+        buf: &mut B,
+    ) -> BufPoll<Result<Self::Target, Self::Error>> {
+        let this = &mut *self;
+        buf_ok!(buf_try!((this.map)(buf_try!(buf_ready!(Pin::new(
+            &mut this.deser
         )
+        .poll_deserialize(ctx, buf))
+        .map_err(MapDeserializeError::Deserialize)))
+        .map_err(MapDeserializeError::Map)))
     }
 }
 
-#[cfg(feature = "alloc")]
-#[doc(inline)]
-pub use _alloc::*;
+enum MapSerializeState<U: MinCodecWrite, E> {
+    Serialize(U::Serialize),
+    Complete,
+    MapError(E),
+}
 
-#[cfg(feature = "alloc")]
-mod _alloc {
-    use super::*;
+pub struct MapSerialize<U: MinCodecWrite, E> {
+    state: MapSerializeState<U, E>,
+}
 
-    use alloc::{
-        string::{FromUtf8Error, String},
-        vec,
-        vec::Vec,
-    };
-    use bitbuf_vlq::{Error, Vlq};
-    use core::convert::TryInto;
-
-    #[derive(Debug)]
-    pub enum StringReadError {
-        Vlq(Error),
-        TooLong,
-        Utf8(FromUtf8Error),
-        Buf(Insufficient),
-    }
-
-    impl From<FromUtf8Error> for StringReadError {
-        fn from(input: FromUtf8Error) -> Self {
-            StringReadError::Utf8(input)
+impl<U: MinCodecWrite, E> MapSerialize<U, E> {
+    pub fn new<T>(item: T, mut map: impl FnMut(T) -> Result<U, E>) -> Self {
+        MapSerialize {
+            state: match (map)(item) {
+                Ok(ser) => MapSerializeState::Serialize(ser.serialize()),
+                Err(e) => MapSerializeState::MapError(e),
+            },
         }
     }
+}
 
-    impl From<Error> for StringReadError {
-        fn from(input: Error) -> Self {
-            StringReadError::Vlq(input)
-        }
-    }
+#[derive(Debug)]
+pub enum MapSerializeError<T, U> {
+    Map(T),
+    Serialize(U),
+}
 
-    impl From<Insufficient> for StringReadError {
-        fn from(input: Insufficient) -> Self {
-            StringReadError::Buf(input)
-        }
-    }
+impl<E: Unpin, U: MinCodecWrite> Serialize for MapSerialize<U, E>
+where
+    U::Serialize: Unpin,
+{
+    type Error = MapSerializeError<E, <U::Serialize as Serialize>::Error>;
 
-    impl MinCodec for String {
-        type WriteError = UnalignedError;
-        type ReadError = StringReadError;
-
-        fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
-            let bytes = self.as_bytes();
-            buf.write_aligned(&*Vlq::from(bytes.len() as u64))?;
-            buf.write_aligned(bytes)?;
-            Ok(())
-        }
-
-        fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
-            let len = Vlq::read(buf)?;
-            let len: usize = len.try_into().map_err(|_| StringReadError::TooLong)?;
-            let mut data = vec![0u8; len];
-            buf.read_aligned(&mut data)?;
-            Ok(String::from_utf8(data)?)
-        }
-    }
-
-    #[derive(Debug)]
-    pub enum VecWriteError<T> {
-        Content(T),
-        Buf(Insufficient),
-    }
-
-    #[derive(Debug)]
-    pub enum VecReadError<T> {
-        Content(T),
-        Vlq(Error),
-        TooLong,
-    }
-
-    impl<T> From<Error> for VecReadError<T> {
-        fn from(input: Error) -> Self {
-            VecReadError::Vlq(input)
-        }
-    }
-
-    impl<T> From<Insufficient> for VecWriteError<T> {
-        fn from(input: Insufficient) -> Self {
-            VecWriteError::Buf(input)
-        }
-    }
-
-    impl<T: MinCodec> MinCodec for Vec<T> {
-        type WriteError = VecWriteError<T::WriteError>;
-        type ReadError = VecReadError<T::ReadError>;
-
-        fn write<B: BitBufMut>(self, buf: &mut B) -> Result<(), Self::WriteError> {
-            buf.write_aligned(&*Vlq::from(self.len() as u64))?;
-            for item in self {
-                item.write(buf).map_err(VecWriteError::Content)?;
+    fn poll_serialize<B: BitBufMut>(
+        mut self: Pin<&mut Self>,
+        ctx: &mut Context,
+        buf: &mut B,
+    ) -> BufPoll<Result<(), Self::Error>> {
+        let this = &mut *self;
+        match &mut this.state {
+            MapSerializeState::MapError(_) => {
+                if let MapSerializeState::MapError(e) =
+                    replace(&mut this.state, MapSerializeState::Complete)
+                {
+                    return BufPoll::Ready(Err(MapSerializeError::Map(e)));
+                } else {
+                    panic!("invalid state")
+                }
             }
-            Ok(())
-        }
-
-        fn read<B: BitBuf>(buf: &mut B) -> Result<Self, Self::ReadError> {
-            let len = Vlq::read(buf)?;
-            let len: usize = len.try_into().map_err(|_| VecReadError::TooLong)?;
-            let mut data = Vec::with_capacity(len);
-            for _ in 0..len {
-                data.push(T::read(buf).map_err(VecReadError::Content)?)
+            MapSerializeState::Serialize(ser) => {
+                buf_try!(buf_ready!(Pin::new(ser).poll_serialize(ctx, buf))
+                    .map_err(MapSerializeError::Serialize));
+                this.state = MapSerializeState::Complete;
+                buf_ok!(())
             }
-            Ok(data)
+            MapSerializeState::Complete => panic!("polled MapSerialize after completion"),
         }
     }
 }
